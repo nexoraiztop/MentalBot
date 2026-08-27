@@ -20,6 +20,7 @@ import uuid
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -63,6 +64,21 @@ CONSOLATION_LABEL = "5⭐"
 
 # Диапазоны для мини-игры с боулингом (🎳 даёт число от 1 до 6)
 RANGE_OPTIONS = [(1, 3), (4, 6)]
+
+# ==== МАГАЗИН ====
+# За каждое выпавшее 777 пользователю начисляется это количество звёзд на баланс магазина
+SHOP_REWARD_PER_JACKPOT = 5
+
+# Товары магазина. NFT сюда сознательно не добавляем — только звёздные призы.
+SHOP_ITEMS = [
+    {"id": "bear_nexo", "label": "🧸 Мишка от Nexo", "price": 100},
+    {"id": "rose_nexo", "label": "🌹❤️ Роза от Nexo", "price": 150},
+    {"id": "gift_nexo", "label": "🎁 Подарок от Nexo", "price": 50},
+]
+
+# Баланс магазина по пользователям (хранится только в памяти процесса —
+# обнуляется при перезапуске бота; для постоянного хранения нужна БД)
+shop_balances: dict[int, float] = {}
 
 router = Router()
 
@@ -114,18 +130,75 @@ def range_keyboard(game_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🏪 Магазин", callback_data="menu:shop")]]
+    )
+
+
+def shop_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"{item['label']} — {item['price']}⭐",
+                callback_data=f"buy:{item['id']}",
+            )
+        ]
+        for item in SHOP_ITEMS
+    ]
+    buttons.append([InlineKeyboardButton(text="« Назад", callback_data="menu:back")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "👋 Привет! Крути слот-машину 🎰 в чате — при выпадении 777 "
+        "стартует игра на прокачку приза, а на баланс магазина "
+        f"падает +{SHOP_REWARD_PER_JACKPOT}⭐.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "menu:shop")
+async def handle_open_shop(callback: CallbackQuery) -> None:
+    balance = shop_balances.get(callback.from_user.id, 0)
+    text = (
+        "🛍 Магазин\n\n"
+        f"⭐ Твой баланс: {balance}\n\n"
+        "Выбери подарок ниже:"
+    )
+    await callback.message.edit_text(text, reply_markup=shop_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:back")
+async def handle_menu_back(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "👋 Главное меню", reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("buy:"))
+async def handle_buy(callback: CallbackQuery) -> None:
+    # Пока подключаем только витрину магазина и баланс — сама покупка
+    # (списание звёзд и выдача приза) будет добавлена следующим шагом.
+    await callback.answer("Покупка скоро будет доступна 🙂", show_alert=True)
+
+
 @router.message(F.dice.emoji == "🎰")
 async def handle_slot_machine(message: Message) -> None:
-    # Пересланные сообщения (в том числе с чужим настоящим броском) игнорируем —
-    # реагируем только на бросок, сделанный прямо в этом чате.
-    if message.forward_origin is not None:
-        return
-
     dice_value = message.dice.value
     if dice_value != SLOT_JACKPOT_VALUE:
         return
 
     user = message.from_user
+
+    # Начисляем звёзды в магазин за каждое выпавшее 777 —
+    # реагируем в том числе и на пересланные сообщения с броском.
+    shop_balances[user.id] = shop_balances.get(user.id, 0) + SHOP_REWARD_PER_JACKPOT
+
     game_id = uuid.uuid4().hex[:12]
     active_games[game_id] = {
         "user_id": user.id,
@@ -192,8 +265,10 @@ async def handle_risk(callback: CallbackQuery) -> None:
 
     text = (
         "🎳 Выберите диапазон кеглей\n\n"
-        "⚠️ Если выпадет число из выбранного вами диапазона — награда "
-        "повышается, если не выпадет — ваша награда сгорает."
+        "Диапазон — это сколько кеглей собьёт бот, когда бросит шар 🎳 "
+        "(от 1 до 6).\n\n"
+        "⚠️ Если результат броска попадёт в выбранный вами диапазон — награда "
+        "повышается, если не попадёт — ваша награда сгорает."
     )
     await callback.message.edit_text(text, reply_markup=range_keyboard(game_id))
     await callback.answer()
