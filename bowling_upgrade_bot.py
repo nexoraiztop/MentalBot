@@ -75,8 +75,20 @@ PRIZE_LADDER = [
     {"label": "NFT 🎁", "value": None, "is_nft": True},
 ]
 
-# Диапазоны для мини-игры с боулингом (🎳 даёт число от 1 до 6)
-RANGE_OPTIONS = [(1, 3), (4, 6)]
+# Диапазоны для мини-игры с боулингом (🎳 даёт число от 1 до 6).
+# На простых уровнях (15→40, 40→75) — 2 диапазона по 3 числа (шанс 50/50 на каждый).
+# На сложных уровнях (75→100, 100→NFT) — 3 диапазона по 2 числа (шанс 33/33/33 на каждый),
+# так угадать becomes сложнее, хотя каждая отдельная кнопка честная.
+RANGE_OPTIONS_EASY = [(1, 3), (4, 6)]
+RANGE_OPTIONS_HARD = [(1, 2), (3, 4), (5, 6)]
+
+# С какого уровня (индекс в PRIZE_LADDER, т.е. ТЕКУЩИЙ приз перед броском)
+# начинают действовать сложные диапазоны из 3 кнопок.
+HARD_RANGE_FROM_LEVEL = 2  # уровень 2 = приз 75⭐ (попытка апгрейда до 100⭐)
+
+
+def get_range_options(level: int) -> list[tuple[int, int]]:
+    return RANGE_OPTIONS_HARD if level >= HARD_RANGE_FROM_LEVEL else RANGE_OPTIONS_EASY
 
 # ==== МАГАЗИН ====
 # За каждое выпавшее 777 пользователю начисляется это количество звёзд на баланс магазина
@@ -133,12 +145,13 @@ def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-def range_keyboard(game_id: str) -> InlineKeyboardMarkup:
+def range_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
+    options = get_range_options(level)
     buttons = [
         InlineKeyboardButton(
             text=f"{lo}-{hi}", callback_data=f"range:{game_id}:{lo}:{hi}"
         )
-        for lo, hi in RANGE_OPTIONS
+        for lo, hi in options
     ]
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
@@ -290,7 +303,9 @@ async def handle_risk(callback: CallbackQuery) -> None:
         f"если не попадёт — ваша награда сгорает"
         f"{custom_emoji(EMOJI_FIRE, '🔥')}"
     )
-    await callback.message.edit_text(text, reply_markup=range_keyboard(game_id))
+    await callback.message.edit_text(
+        text, reply_markup=range_keyboard(game_id, game["level"])
+    )
     await callback.answer()
 
 
@@ -364,6 +379,10 @@ async def main() -> None:
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
