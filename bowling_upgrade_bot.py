@@ -487,7 +487,7 @@ def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
     # обычный юникод-фолбэк тех же ID (🎁 / 💎), как договорились.
     buttons = [
         InlineKeyboardButton(
-            text=f"🎁 Забрать {prize['label']}",
+            text=f" {Icon_custom_emoji_id = '5280615440928758599'} Забрать {prize['label']}",
             callback_data=f"claim:{game_id}",
         )
     ]
