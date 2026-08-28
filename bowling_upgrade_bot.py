@@ -21,7 +21,7 @@ import uuid
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -85,6 +85,19 @@ EMOJI_HANDS = "5008248651038852115"            # 🫴 "Фармить звёзд
 # не показывает, работает только запасной юникод-символ — см. пояснение в чате)
 EMOJI_BTN_CLAIM = "5280615440928758599"        # 🎁 кнопка "Забрать приз"
 EMOJI_BTN_RISK = "5280922999241859582"         # 💎 кнопка "Испытать удачу"
+
+# ID премиум-эмодзи — часовое рекламное напоминание (/promo_on)
+EMOJI_R_SLOT = "5915833712368424979"           # 🎰 (используется несколько раз)
+EMOJI_R_TROPHY = "5388773012478659078"         # 🏆 (используется дважды)
+EMOJI_R_CHART = "5197503331215361533"          # 📈 "ПРАВИЛА ЛЕСЕНКИ"
+EMOJI_R_GIFT = "5436006606078769970"           # 🎁 "Забрать награду"
+EMOJI_R_TARGET = "5310278924616356636"         # 🎯 "Испытать удачу"
+EMOJI_R_WARNING = "5275986299407344497"        # ⚠️ "Не повезёт..."
+EMOJI_R_FIRE = "5190600446892326598"           # 🔥 "сгорает"
+EMOJI_R_SALUTE = "6050773179557745617"         # 🫡 в конце текста
+
+# Как часто слать напоминание, пока оно включено (в секундах)
+REMINDER_INTERVAL_SECONDS = 60 * 60  # 1 час
 
 # Значение dice.value == 64 соответствует комбинации 777 на слот-машине 🎰
 SLOT_JACKPOT_VALUE = 64
@@ -177,6 +190,11 @@ def init_db() -> None:
             "balance BIGINT NOT NULL DEFAULT 0"
             ")"
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS reminder_chats ("
+            "chat_id BIGINT PRIMARY KEY"
+            ")"
+        )
         conn.commit()
         cur.close()
     else:
@@ -184,6 +202,11 @@ def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS balances ("
             "user_id INTEGER PRIMARY KEY, "
             "balance INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS reminder_chats ("
+            "chat_id INTEGER PRIMARY KEY"
             ")"
         )
         conn.commit()
@@ -203,6 +226,44 @@ def get_balance(user_id: int) -> int:
     cur.close()
     conn.close()
     return row[0] if row else 0
+
+
+def enable_reminder_chat(chat_id: int) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO reminder_chats (chat_id) VALUES (%s) "
+            "ON CONFLICT (chat_id) DO NOTHING",
+            (chat_id,),
+        )
+    else:
+        cur.execute(
+            "INSERT OR IGNORE INTO reminder_chats (chat_id) VALUES (?)", (chat_id,)
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def disable_reminder_chat(chat_id: int) -> None:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute(f"DELETE FROM reminder_chats WHERE chat_id = {placeholder}", (chat_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_reminder_chats() -> list[int]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT chat_id FROM reminder_chats")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [row[0] for row in rows]
 
 
 def add_balance(user_id: int, amount: int) -> None:
@@ -229,6 +290,9 @@ router = Router()
 # Активные игры: game_id -> {"user_id", "level", "chat_id"}
 active_games: dict[str, dict] = {}
 
+# Активные задачи почасового напоминания: chat_id -> asyncio.Task
+reminder_tasks: dict[int, asyncio.Task] = {}
+
 
 def custom_emoji(emoji_id: str, fallback: str) -> str:
     return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
@@ -244,6 +308,54 @@ def mention(user_id: int, name: str) -> str:
 
 def admins_line() -> str:
     return " ".join(f"@{u}" for u in ADMIN_USERNAMES)
+
+
+def build_reminder_text() -> str:
+    star = custom_emoji(EMOJI_STAR_JACKPOT, "⭐️")
+    return (
+        f"{custom_emoji(EMOJI_R_SLOT, '🎰')}ИГРАЙ И ЗАБИРАЙ {star} ВСЕГО ЗА "
+        f"1{custom_emoji(EMOJI_STAR_HEADER, '🌟')}\n\n"
+        f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} ДЖЕКПОТ ЧАТА: смотри @Mentalludo_Bot\n\n"
+        f"{custom_emoji(EMOJI_R_CHART, '📈')} ПРАВИЛА ЛЕСЕНКИ:\n\n"
+        f"{custom_emoji(EMOJI_R_SLOT, '🎰')} Выбил {sevens_text()}: "
+        f"15 {star} ➔ 40 {star} ➔ 75 {star} ➔ 100{star}\n\n"
+        f"{custom_emoji(EMOJI_STAR_HEADER, '🌟')} КАК ИГРАТЬ:\n\n"
+        f"{custom_emoji(EMOJI_R_SLOT, '🎰')} Выбил {sevens_text()} — получаешь "
+        f"шанс начать лесенку с 15 {star}\n\n"
+        f"🎳 На каждом этапе решай сам:\n"
+        f"{custom_emoji(EMOJI_R_GIFT, '🎁')} Забрать награду или "
+        f"{custom_emoji(EMOJI_R_TARGET, '🎯')} Испытать удачу и подняться выше!\n\n"
+        f"{custom_emoji(EMOJI_R_WARNING, '⚠️')} Не повезёт — текущая награда "
+        f"сгорает {custom_emoji(EMOJI_R_FIRE, '🔥')}\n\n"
+        f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} Дойдёшь до 100{star} — забирай "
+        f"главный приз!\n\n"
+        f"Скоро в лудку добавится NFT{custom_emoji(EMOJI_R_SALUTE, '🫡')}"
+    )
+
+
+async def reminder_loop(bot: Bot, chat_id: int) -> None:
+    """Раз в REMINDER_INTERVAL_SECONDS шлёт промо-текст в чат, пока не отменят."""
+    try:
+        while True:
+            try:
+                await bot.send_message(chat_id, build_reminder_text())
+            except Exception as e:
+                logging.error("Не удалось отправить напоминание в %s: %s", chat_id, e)
+            await asyncio.sleep(REMINDER_INTERVAL_SECONDS)
+    except asyncio.CancelledError:
+        pass
+
+
+def start_reminder(bot: Bot, chat_id: int) -> None:
+    if chat_id in reminder_tasks:
+        return
+    reminder_tasks[chat_id] = asyncio.create_task(reminder_loop(bot, chat_id))
+
+
+def stop_reminder(chat_id: int) -> None:
+    task = reminder_tasks.pop(chat_id, None)
+    if task:
+        task.cancel()
 
 
 def build_main_menu_text() -> str:
@@ -351,6 +463,33 @@ def shop_keyboard() -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(build_main_menu_text(), reply_markup=main_menu_keyboard())
+
+
+@router.message(Command("promo_on"))
+async def cmd_promo_on(message: Message) -> None:
+    chat_id = message.chat.id
+    if chat_id in reminder_tasks:
+        await message.reply("Напоминание уже запущено в этом чате ✅")
+        return
+
+    enable_reminder_chat(chat_id)
+    start_reminder(message.bot, chat_id)
+    minutes = REMINDER_INTERVAL_SECONDS // 60
+    await message.reply(
+        f"✅ Напоминание запущено — буду присылать промо каждые {minutes} мин."
+    )
+
+
+@router.message(Command("promo_off"))
+async def cmd_promo_off(message: Message) -> None:
+    chat_id = message.chat.id
+    if chat_id not in reminder_tasks:
+        await message.reply("В этом чате напоминание и так не запущено.")
+        return
+
+    stop_reminder(chat_id)
+    disable_reminder_chat(chat_id)
+    await message.reply("🛑 Напоминание остановлено.")
 
 
 @router.callback_query(F.data == "menu:shop")
@@ -557,6 +696,10 @@ async def main() -> None:
     )
     dp = Dispatcher()
     dp.include_router(router)
+
+    # Восстанавливаем почасовые напоминания, включённые до перезапуска/редеплоя
+    for chat_id in get_reminder_chats():
+        start_reminder(bot, chat_id)
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
