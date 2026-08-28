@@ -37,7 +37,7 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 # Username админов для выдачи приза (без @)
-ADMIN_USERNAMES = ["nexoraizfuck"]
+ADMIN_USERNAMES = ["dol1ro"]
 
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
@@ -63,6 +63,28 @@ EMOJI_SIX = "5891120371762990493"              # 6️⃣ "бросит шар 6"
 EMOJI_WARNING = "5447644880824181073"          # ⚠️ предупреждение про сгорание
 EMOJI_MEDAL = "5170149156953523243"            # 🎖 "испытать удачу ещё, или забрать приз?"
 EMOJI_SPARKLES = "4963511421280192936"         # 💫 "За выдачей пишите"
+
+# ID премиум-эмодзи — главное меню (/start)
+EMOJI_WAVE = "4918354603281482671"             # 👋 "Привет! Ты в главном меню"
+EMOJI_MENU_MEDAL = "4938313951961155725"       # 🎖 "Здесь ты можешь переходить..."
+EMOJI_GAMEPAD = "5012808218385058363"          # 🎮 "Основной фарм звёзд"
+EMOJI_MENU_DIAMOND = "5294460341021862670"     # 💎 "Выбери нужное действие"
+EMOJI_POINT_DOWN = "5231102735817918643"       # 👇 в конце меню
+
+# ID премиум-эмодзи — магазин
+EMOJI_STAR_FACE = "4938214716741781530"        # 🤩 "Добро пожаловать в Магазин"
+EMOJI_SHOP_BEAR = "5294227158657427099"        # 🧸 (используется и одиночно, и рядом x3)
+EMOJI_SHOP_ROCKET = "5296738580654221916"      # 🚀 (используется и одиночно, и рядом x3)
+EMOJI_SHOP_DIAMOND = "5296474019258721875"     # 💎 (используется и одиночно, и рядом x3)
+EMOJI_SHOP_FIRE = "5116414868357907335"        # 🔥 "Максимальная выгода!"
+EMOJI_COIN = "4965663015211894662"             # 🪙 "Твой баланс"
+EMOJI_HOURGLASS = "5891211339170326418"        # ⌛️ напоминание про очередь выдачи
+EMOJI_HANDS = "5008248651038852115"            # 🫴 "Фармить звёзды можешь в чате..."
+
+# ID премиум-эмодзи — кнопки джекпота (реальной анимации на кнопках Telegram
+# не показывает, работает только запасной юникод-символ — см. пояснение в чате)
+EMOJI_BTN_CLAIM = "5280615440928758599"        # 🎁 кнопка "Забрать приз"
+EMOJI_BTN_RISK = "5280922999241859582"         # 💎 кнопка "Испытать удачу"
 
 # Значение dice.value == 64 соответствует комбинации 777 на слот-машине 🎰
 SLOT_JACKPOT_VALUE = 64
@@ -93,13 +115,30 @@ def get_range_options(level: int) -> list[tuple[int, int]]:
 
 # ==== МАГАЗИН ====
 # За каждое выпавшее 777 пользователю начисляется это количество звёзд на баланс магазина
-SHOP_REWARD_PER_JACKPOT = 5
+SHOP_REWARD_PER_JACKPOT = 10
 
-# Товары магазина. NFT сюда сознательно не добавляем — только звёздные призы.
+# Название бренда/чата, которые упоминаются в текстах магазина и меню —
+# поменяй под свои реальные названия.
+SHOP_BRAND_NAME = "nexoraiza"
+FARM_CHAT_USERNAME = "mentalLudo"
+
+# Товары магазина: одиночные и "рядами" (по 3шт со скидкой).
+# Используются для кнопок покупки (там только обычный юникод — Telegram не
+# поддерживает премиум-эмодзи на кнопках) и для текста витрины (там уже
+# премиум-эмодзи, см. build_shop_text ниже).
 SHOP_ITEMS = [
-    {"id": "bear_nexo", "label": "🧸 Мишка от Nexo", "price": 100},
-    {"id": "rose_nexo", "label": "🌹❤️ Роза от Nexo", "price": 150},
-    {"id": "gift_nexo", "label": "🎁 Подарок от Nexo", "price": 50},
+    {"id": "bear", "emoji_id": EMOJI_SHOP_BEAR, "emoji": "🧸", "name": "Мишка",
+     "price": 250, "qty": 1, "note": "(Самый невыгодный вариант)"},
+    {"id": "rocket", "emoji_id": EMOJI_SHOP_ROCKET, "emoji": "🚀", "name": "Ракета",
+     "price": 650, "qty": 1, "note": ""},
+    {"id": "diamond", "emoji_id": EMOJI_SHOP_DIAMOND, "emoji": "💎", "name": "Алмаз",
+     "price": 1500, "qty": 1, "note": ""},
+    {"id": "bear_row", "emoji_id": EMOJI_SHOP_BEAR, "emoji": "🧸", "name": "Ряд мишек",
+     "price": 600, "qty": 3, "note": "(Выгода: 3 по цене 2.4)"},
+    {"id": "rocket_row", "emoji_id": EMOJI_SHOP_ROCKET, "emoji": "🚀", "name": "Ряд ракет",
+     "price": 1500, "qty": 3, "note": "(Выгода: 3 по цене 2.3)"},
+    {"id": "diamond_row", "emoji_id": EMOJI_SHOP_DIAMOND, "emoji": "💎", "name": "Ряд алмазов",
+     "price": 3000, "qty": 3, "note": ""},
 ]
 
 # Баланс магазина хранится в базе данных, а не в памяти процесса — иначе
@@ -207,8 +246,61 @@ def admins_line() -> str:
     return " ".join(f"@{u}" for u in ADMIN_USERNAMES)
 
 
+def build_main_menu_text() -> str:
+    return (
+        f"{custom_emoji(EMOJI_WAVE, '👋')}Привет! Ты в главном меню {SHOP_BRAND_NAME}\n"
+        f"{custom_emoji(EMOJI_MENU_MEDAL, '🎖')}Здесь ты можешь переходить к обмену "
+        f"накопленных звёзд на крутые призы, открывать маркетплейс и переходить в "
+        f"игровой чат для фарма!\n\n"
+        f"<blockquote>{custom_emoji(EMOJI_GAMEPAD, '🎮')} Основной фарм звезд:\n"
+        f"Залетай в наш чат @{FARM_CHAT_USERNAME}, выбивай комбинацию 777 в игровых "
+        f"автоматах и забирай +{SHOP_REWARD_PER_JACKPOT} звёзд моментально прямо на "
+        f"свой счет!</blockquote>\n"
+        f"{custom_emoji(EMOJI_MENU_DIAMOND, '💎')} Выбери нужное действие на кнопках "
+        f"ниже{custom_emoji(EMOJI_POINT_DOWN, '👇')}:"
+    )
+
+
+def build_shop_text(balance: int) -> str:
+    lines = [
+        f"{custom_emoji(EMOJI_STAR_FACE, '🤩')}Добро пожаловать в Магазин {SHOP_BRAND_NAME}!",
+        "<u>Здесь ты можешь обменять свои звёзды на крутые подарки "
+        "(покупать оптом — гораздо дешевле!):</u>",
+    ]
+
+    item_lines = []
+    for item in SHOP_ITEMS:
+        icon = custom_emoji(item["emoji_id"], item["emoji"]) * item["qty"]
+        star = custom_emoji(EMOJI_STAR_CLAIM, "⭐️")
+        line = f"• {icon} {item['name']} — {item['price']} {star}"
+        if item["note"]:
+            line += f" {item['note']}"
+        item_lines.append(line)
+    # У самого выгодного товара (последний в списке) пометка идёт отдельной строкой
+    item_lines.append(f"{custom_emoji(EMOJI_SHOP_FIRE, '🔥')} (Максимальная выгода!)")
+
+    lines.append("<blockquote>" + "\n".join(item_lines) + "</blockquote>")
+    lines.append(f"{custom_emoji(EMOJI_COIN, '🪙')} Твой баланс: {balance} звёзд")
+    lines.append("")
+    lines.append(
+        f"{custom_emoji(EMOJI_HOURGLASS, '⌛️')} Напоминание: При выводе призов "
+        f"учитывайте, что подарок может прийти не сразу. Все заявки обрабатываются "
+        f"в порядке очереди, поэтому не паникуйте — ваш выигрыш обязательно дойдет!"
+    )
+    lines.append("")
+    lines.append(
+        f"{custom_emoji(EMOJI_HANDS, '🫴')} Фармить звёзды ты можешь в нашем чате "
+        f"@{FARM_CHAT_USERNAME}! Выбивай комбинацию 777 и получай "
+        f"+{SHOP_REWARD_PER_JACKPOT} звёзд сразу на свой баланс в магазине! "
+        f"Скорее заходи, крути и забирай!"
+    )
+    return "\n".join(lines)
+
+
 def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
     prize = PRIZE_LADDER[level]
+    # Премиум-эмодзи на кнопках Telegram не отображаются — используем
+    # обычный юникод-фолбэк тех же ID (🎁 / 💎), как договорились.
     buttons = [
         InlineKeyboardButton(
             text=f"🎁 Забрать {prize['label']}",
@@ -219,7 +311,7 @@ def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
     if level < len(PRIZE_LADDER) - 1:
         buttons.append(
             InlineKeyboardButton(
-                text="🎳 Испытать удачу", callback_data=f"risk:{game_id}"
+                text="💎 Испытать удачу", callback_data=f"risk:{game_id}"
             )
         )
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
@@ -246,7 +338,7 @@ def shop_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [
             InlineKeyboardButton(
-                text=f"{item['label']} — {item['price']}⭐",
+                text=f"{item['emoji'] * item['qty']} {item['name']} — {item['price']}⭐",
                 callback_data=f"buy:{item['id']}",
             )
         ]
@@ -258,22 +350,13 @@ def shop_keyboard() -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "👋 Привет! Крути слот-машину 🎰 в чате — при выпадении 777 "
-        "стартует игра на прокачку приза, а на баланс магазина "
-        f"падает +{SHOP_REWARD_PER_JACKPOT}⭐.",
-        reply_markup=main_menu_keyboard(),
-    )
+    await message.answer(build_main_menu_text(), reply_markup=main_menu_keyboard())
 
 
 @router.callback_query(F.data == "menu:shop")
 async def handle_open_shop(callback: CallbackQuery) -> None:
     balance = get_balance(callback.from_user.id)
-    text = (
-        "🛍 Магазин\n\n"
-        f"⭐ Твой баланс: {balance}\n\n"
-        "Выбери подарок ниже:"
-    )
+    text = build_shop_text(balance)
     await callback.message.edit_text(text, reply_markup=shop_keyboard())
     await callback.answer()
 
@@ -281,7 +364,7 @@ async def handle_open_shop(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:back")
 async def handle_menu_back(callback: CallbackQuery) -> None:
     await callback.message.edit_text(
-        "👋 Главное меню", reply_markup=main_menu_keyboard()
+        build_main_menu_text(), reply_markup=main_menu_keyboard()
     )
     await callback.answer()
 
