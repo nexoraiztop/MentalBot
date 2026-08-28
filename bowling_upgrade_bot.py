@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import random
+import sqlite3
 import uuid
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -36,7 +37,7 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 # Username админов для выдачи приза (без @)
-ADMIN_USERNAMES = ["nexoraizfuck"]
+ADMIN_USERNAMES = ["dol1ro"]
 
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
@@ -101,9 +102,88 @@ SHOP_ITEMS = [
     {"id": "gift_nexo", "label": "🎁 Подарок от Nexo", "price": 50},
 ]
 
-# Баланс магазина по пользователям (хранится только в памяти процесса —
-# обнуляется при перезапуске бота; для постоянного хранения нужна БД)
-shop_balances: dict[int, float] = {}
+# Баланс магазина хранится в базе данных, а не в памяти процесса — иначе
+# он обнулялся бы при каждом редеплое.
+#
+# Если Railway даёт переменную DATABASE_URL (после того как в проект добавлен
+# сервис PostgreSQL) — используем Postgres, он персистентный и переживает
+# любой редеплой без дополнительной настройки.
+#
+# Если DATABASE_URL не задан — работаем через локальный SQLite-файл (удобно
+# для теста на своём компьютере, но на Railway без Postgres это НЕ переживёт
+# редеплой).
+DATABASE_URL = os.getenv("DATABASE_URL")
+DB_PATH = os.getenv("DB_PATH", "shop.db")
+
+USE_POSTGRES = bool(DATABASE_URL)
+
+if USE_POSTGRES:
+    import psycopg2
+    import psycopg2.extensions
+
+
+def _get_conn():
+    if USE_POSTGRES:
+        return psycopg2.connect(DATABASE_URL)
+    return sqlite3.connect(DB_PATH)
+
+
+def init_db() -> None:
+    conn = _get_conn()
+    if USE_POSTGRES:
+        cur = conn.cursor()
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS balances ("
+            "user_id BIGINT PRIMARY KEY, "
+            "balance BIGINT NOT NULL DEFAULT 0"
+            ")"
+        )
+        conn.commit()
+        cur.close()
+    else:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS balances ("
+            "user_id INTEGER PRIMARY KEY, "
+            "balance INTEGER NOT NULL DEFAULT 0"
+            ")"
+        )
+        conn.commit()
+    conn.close()
+
+    logging.info(
+        "Хранилище баланса: %s", "PostgreSQL" if USE_POSTGRES else f"SQLite ({DB_PATH})"
+    )
+
+
+def get_balance(user_id: int) -> int:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute(f"SELECT balance FROM balances WHERE user_id = {placeholder}", (user_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] if row else 0
+
+
+def add_balance(user_id: int, amount: int) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO balances (user_id, balance) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET balance = balances.balance + EXCLUDED.balance",
+            (user_id, amount),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO balances (user_id, balance) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET balance = balance + excluded.balance",
+            (user_id, amount),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
 
 router = Router()
 
@@ -188,7 +268,7 @@ async def cmd_start(message: Message) -> None:
 
 @router.callback_query(F.data == "menu:shop")
 async def handle_open_shop(callback: CallbackQuery) -> None:
-    balance = shop_balances.get(callback.from_user.id, 0)
+    balance = get_balance(callback.from_user.id)
     text = (
         "🛍 Магазин\n\n"
         f"⭐ Твой баланс: {balance}\n\n"
@@ -223,7 +303,7 @@ async def handle_slot_machine(message: Message) -> None:
 
     # Начисляем звёзды в магазин за каждое выпавшее 777 —
     # реагируем в том числе и на пересланные сообщения с броском.
-    shop_balances[user.id] = shop_balances.get(user.id, 0) + SHOP_REWARD_PER_JACKPOT
+    add_balance(user.id, SHOP_REWARD_PER_JACKPOT)
 
     game_id = uuid.uuid4().hex[:12]
     active_games[game_id] = {
@@ -386,6 +466,8 @@ async def handle_range_choice(callback: CallbackQuery) -> None:
 
 
 async def main() -> None:
+    init_db()
+
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
