@@ -37,7 +37,7 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 # Username админов для выдачи приза (без @)
-ADMIN_USERNAMES = ["nexoraizfuck"]
+ADMIN_USERNAMES = ["dol1ro"]
 
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
@@ -102,14 +102,28 @@ REMINDER_INTERVAL_SECONDS = 60 * 60  # 1 час
 # Значение dice.value == 64 соответствует комбинации 777 на слот-машине 🎰
 SLOT_JACKPOT_VALUE = 64
 
-# Лестница призов. Последний уровень — NFT (особый флаг is_nft=True)
-PRIZE_LADDER = [
+# Лестница призов. Последний уровень при включённом режиме NFT — сам NFT
+# (особый флаг is_nft=True). Когда режим NFT выключен командой /nft_off,
+# последний уровень временно заменяется на обычную звёздную награду —
+# см. FALLBACK_TOP_PRIZE и get_prize_ladder() ниже.
+PRIZE_LADDER_BASE = [
     {"label": "15⭐", "value": 15, "is_nft": False},
     {"label": "40⭐", "value": 40, "is_nft": False},
     {"label": "75⭐", "value": 75, "is_nft": False},
     {"label": "100⭐", "value": 100, "is_nft": False},
-    {"label": "NFT 🎁", "value": None, "is_nft": True},
 ]
+NFT_TOP_PRIZE = {"label": "NFT 🎁", "value": None, "is_nft": True}
+# Чем награждаем на верхнем уровне, пока режим NFT выключен
+FALLBACK_TOP_PRIZE = {"label": "200⭐", "value": 200, "is_nft": False}
+
+# Включён ли режим NFT прямо сейчас — читается/пишется через settings-таблицу
+# в БД (см. init_db/get_nft_enabled/set_nft_enabled), чтобы переживать рестарт.
+_nft_enabled_cache: bool | None = None
+
+
+def get_prize_ladder() -> list[dict]:
+    top = NFT_TOP_PRIZE if get_nft_enabled() else FALLBACK_TOP_PRIZE
+    return PRIZE_LADDER_BASE + [top]
 
 # Диапазоны для мини-игры с боулингом (🎳 даёт число от 1 до 6).
 # На простых уровнях (15→40, 40→75) — 2 диапазона по 3 числа (шанс 50/50 на каждый).
@@ -128,7 +142,7 @@ def get_range_options(level: int) -> list[tuple[int, int]]:
 
 # ==== МАГАЗИН ====
 # За каждое выпавшее 777 пользователю начисляется это количество звёзд на баланс магазина
-SHOP_REWARD_PER_JACKPOT = 10
+SHOP_REWARD_PER_JACKPOT = 20
 
 # Название бренда/чата, которые упоминаются в текстах магазина и меню —
 # поменяй под свои реальные названия.
@@ -195,6 +209,12 @@ def init_db() -> None:
             "chat_id BIGINT PRIMARY KEY"
             ")"
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS settings ("
+            "key TEXT PRIMARY KEY, "
+            "value TEXT NOT NULL"
+            ")"
+        )
         conn.commit()
         cur.close()
     else:
@@ -207,6 +227,12 @@ def init_db() -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS reminder_chats ("
             "chat_id INTEGER PRIMARY KEY"
+            ")"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings ("
+            "key TEXT PRIMARY KEY, "
+            "value TEXT NOT NULL"
             ")"
         )
         conn.commit()
@@ -284,6 +310,51 @@ def add_balance(user_id: int, amount: int) -> None:
     conn.commit()
     cur.close()
     conn.close()
+
+
+NFT_SETTING_KEY = "nft_enabled"
+
+
+def get_nft_enabled() -> bool:
+    """Читает флаг из settings-таблицы (по умолчанию — включено), с кэшем
+    в памяти процесса, чтобы не ходить в БД на каждый рендер клавиатуры."""
+    global _nft_enabled_cache
+    if _nft_enabled_cache is not None:
+        return _nft_enabled_cache
+
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute(f"SELECT value FROM settings WHERE key = {placeholder}", (NFT_SETTING_KEY,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    _nft_enabled_cache = (row is None) or (row[0] == "1")
+    return _nft_enabled_cache
+
+
+def set_nft_enabled(enabled: bool) -> None:
+    global _nft_enabled_cache
+    conn = _get_conn()
+    cur = conn.cursor()
+    value = "1" if enabled else "0"
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (NFT_SETTING_KEY, value),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (NFT_SETTING_KEY, value),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+    _nft_enabled_cache = enabled
 
 router = Router()
 
@@ -410,7 +481,8 @@ def build_shop_text(balance: int) -> str:
 
 
 def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
-    prize = PRIZE_LADDER[level]
+    ladder = get_prize_ladder()
+    prize = ladder[level]
     # Премиум-эмодзи на кнопках Telegram не отображаются — используем
     # обычный юникод-фолбэк тех же ID (🎁 / 💎), как договорились.
     buttons = [
@@ -420,7 +492,7 @@ def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
         )
     ]
     # На последнем уровне (NFT) дальше рисковать некуда
-    if level < len(PRIZE_LADDER) - 1:
+    if level < len(ladder) - 1:
         buttons.append(
             InlineKeyboardButton(
                 text="💎 Испытать удачу", callback_data=f"risk:{game_id}"
@@ -492,6 +564,37 @@ async def cmd_promo_off(message: Message) -> None:
     await message.reply("🛑 Напоминание остановлено.")
 
 
+def is_admin(username: str | None) -> bool:
+    return username is not None and username in ADMIN_USERNAMES
+
+
+@router.message(Command("nft_off"))
+async def cmd_nft_off(message: Message) -> None:
+    if not is_admin(message.from_user.username):
+        await message.reply("Эта команда доступна только админам.")
+        return
+    if not get_nft_enabled():
+        await message.reply("Режим NFT и так выключен.")
+        return
+    set_nft_enabled(False)
+    await message.reply(
+        f"🛑 Режим NFT выключен. Верхний уровень лесенки теперь выдаёт "
+        f"{FALLBACK_TOP_PRIZE['label']} вместо NFT — до команды /nft_on."
+    )
+
+
+@router.message(Command("nft_on"))
+async def cmd_nft_on(message: Message) -> None:
+    if not is_admin(message.from_user.username):
+        await message.reply("Эта команда доступна только админам.")
+        return
+    if get_nft_enabled():
+        await message.reply("Режим NFT и так включён.")
+        return
+    set_nft_enabled(True)
+    await message.reply("✅ Режим NFT снова включён.")
+
+
 @router.callback_query(F.data == "menu:shop")
 async def handle_open_shop(callback: CallbackQuery) -> None:
     balance = get_balance(callback.from_user.id)
@@ -535,7 +638,7 @@ async def handle_slot_machine(message: Message) -> None:
         "last_message_id": None,  # заполнится ниже, после отправки сообщения
     }
 
-    prize = PRIZE_LADDER[0]
+    prize = get_prize_ladder()[0]
     text = (
         f"{custom_emoji(EMOJI_PARTY_JACKPOT, '🎉')} Поздравляем "
         f"{mention(user.id, user.full_name)}, вы выиграли!\n\n"
@@ -562,7 +665,7 @@ async def handle_claim(callback: CallbackQuery) -> None:
         await callback.answer("Это не твой приз 🙂", show_alert=True)
         return
 
-    prize = PRIZE_LADDER[game["level"]]
+    prize = get_prize_ladder()[game["level"]]
     user = callback.from_user
 
     if prize["is_nft"]:
@@ -649,7 +752,7 @@ async def handle_range_choice(callback: CallbackQuery) -> None:
 
     if lo <= pins <= hi:
         game["level"] += 1
-        prize = PRIZE_LADDER[game["level"]]
+        prize = get_prize_ladder()[game["level"]]
         text = (
             f"🎳 Выпало: {pins}\n\n"
             f"{custom_emoji(EMOJI_STAR_HEADER, '🌟')}Поздравляем, ваша "
