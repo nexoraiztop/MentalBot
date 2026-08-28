@@ -230,6 +230,7 @@ async def handle_slot_machine(message: Message) -> None:
         "user_id": user.id,
         "level": 0,
         "chat_id": message.chat.id,
+        "last_message_id": None,  # заполнится ниже, после отправки сообщения
     }
 
     prize = PRIZE_LADDER[0]
@@ -243,7 +244,8 @@ async def handle_slot_machine(message: Message) -> None:
         f"или испытать удачу, чтобы получить награду получше"
         f"{custom_emoji(EMOJI_CHECK, '✅')}"
     )
-    await message.reply(text, reply_markup=prize_keyboard(game_id, 0))
+    sent = await message.reply(text, reply_markup=prize_keyboard(game_id, 0))
+    active_games[game_id]["last_message_id"] = sent.message_id
 
 
 @router.callback_query(F.data.startswith("claim:"))
@@ -324,10 +326,19 @@ async def handle_range_choice(callback: CallbackQuery) -> None:
 
     await callback.answer()
 
-    # Бот сам бросает боулинг-шар и получает результат прямо из ответа Telegram
+    # Убираем кнопки диапазона сразу после выбора, чтобы по ним нельзя было
+    # нажать повторно и чтобы было видно, какой вариант выбрал пользователь.
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+    # Бот сам бросает боулинг-шар — отвечает на предыдущее сообщение цепочки,
+    # чтобы в чате было видно, к какой игре относится бросок.
     dice_message = await callback.bot.send_dice(
-        chat_id=game["chat_id"], emoji="🎳"
+        chat_id=game["chat_id"],
+        emoji="🎳",
+        reply_to_message_id=game["last_message_id"],
     )
+    game["last_message_id"] = dice_message.message_id
+
     # Небольшая пауза, чтобы анимация броска успела доиграть у пользователя
     await asyncio.sleep(4)
     pins = dice_message.dice.value  # число от 1 до 6
@@ -354,19 +365,24 @@ async def handle_range_choice(callback: CallbackQuery) -> None:
                 f"{custom_emoji(EMOJI_SPARKLES, '💫')}"
             )
 
-        await callback.message.answer(
-            text, reply_markup=prize_keyboard(game_id, game["level"])
+        # Отвечаем на сообщение с результатом броска (кегли), сохраняем id
+        # этого сообщения, чтобы следующий раунд тоже встроился в цепочку.
+        result_message = await callback.message.answer(
+            text,
+            reply_markup=prize_keyboard(game_id, game["level"]),
+            reply_to_message_id=game["last_message_id"],
         )
+        game["last_message_id"] = result_message.message_id
     else:
-        del active_games[game_id]
-        text = (
+        result_message = await callback.message.answer(
             f"🎳 Выпало: {pins}\n\n"
             f"{custom_emoji(EMOJI_CRY, '😭')}Увы, не повезло! Ваша награда "
             f"сгорела.\n\n"
             f"{custom_emoji(EMOJI_STAR_RETRY, '⭐')}Попробуйте ещё раз"
-            f"{custom_emoji(EMOJI_SMILE, '😃')}"
+            f"{custom_emoji(EMOJI_SMILE, '😃')}",
+            reply_to_message_id=game["last_message_id"],
         )
-        await callback.message.answer(text)
+        del active_games[game_id]
 
 
 async def main() -> None:
@@ -379,10 +395,6 @@ async def main() -> None:
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 if __name__ == "__main__":
