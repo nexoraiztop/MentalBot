@@ -46,8 +46,8 @@ INFINITE_BALANCE_USERNAMES = ["Nexoraizfuck"]
 
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
-    "http://t.me/nft/XmasStocking-169190",
-    "https://t.me/nft/ChillFlame-64612"
+    "http://t.me/nft/ViceCream-157848",
+    "http://t.me/nft/ViceCream-112371",
 ]
 
 # ID премиум-эмодзи, по местам использования
@@ -135,6 +135,7 @@ BUTTON_ICONS = {
     "range": EMOJI_SIX,              # 6️⃣ кнопки диапазона (1-3, 4-6, 1-2 и т.д.)
     "shop_menu": EMOJI_COIN,         # 🪙 кнопка "Магазин" в главном меню
     "profile_menu": EMOJI_PROFILE_PERSON,  # 👤 кнопка "Профиль" в главном меню
+    "top_menu": EMOJI_R_TROPHY,      # 🏆 кнопка "Топ" в главном меню
 }
 # Хочешь новую иконку на какой-то из этих кнопок — просто впиши сюда новый
 # ID строкой (или замени ссылку на константу типа EMOJI_SIX/EMOJI_COIN
@@ -263,6 +264,12 @@ def init_db() -> None:
             ")"
         )
         cur.execute(
+            "CREATE TABLE IF NOT EXISTS user_names ("
+            "user_id BIGINT PRIMARY KEY, "
+            "display_name TEXT NOT NULL"
+            ")"
+        )
+        cur.execute(
             "CREATE TABLE IF NOT EXISTS user_stats ("
             "user_id BIGINT PRIMARY KEY, "
             "spins BIGINT NOT NULL DEFAULT 0, "
@@ -274,6 +281,7 @@ def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS purchase_requests ("
             "id SERIAL PRIMARY KEY, "
             "user_id BIGINT NOT NULL, "
+            "username TEXT, "
             "chat_id BIGINT NOT NULL, "
             "item_id TEXT NOT NULL, "
             "item_name TEXT NOT NULL, "
@@ -300,6 +308,12 @@ def init_db() -> None:
             ")"
         )
         cur.execute(
+            "CREATE TABLE IF NOT EXISTS user_names ("
+            "user_id INTEGER PRIMARY KEY, "
+            "display_name TEXT NOT NULL"
+            ")"
+        )
+        cur.execute(
             "CREATE TABLE IF NOT EXISTS user_stats ("
             "user_id INTEGER PRIMARY KEY, "
             "spins INTEGER NOT NULL DEFAULT 0, "
@@ -311,6 +325,7 @@ def init_db() -> None:
             "CREATE TABLE IF NOT EXISTS purchase_requests ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "user_id INTEGER NOT NULL, "
+            "username TEXT, "
             "chat_id INTEGER NOT NULL, "
             "item_id TEXT NOT NULL, "
             "item_name TEXT NOT NULL, "
@@ -460,6 +475,43 @@ def set_nft_enabled(enabled: bool) -> None:
     _nft_enabled_cache = enabled
 
 
+ADMIN_CHAT_ID_KEY = "admin_chat_id"
+
+
+def get_admin_chat_id() -> int | None:
+    """Личный чат админа с ботом, куда шлём заявки на вывод. Заполняется
+    автоматически, когда админ первый раз пишет боту /start в личку."""
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute(f"SELECT value FROM settings WHERE key = {placeholder}", (ADMIN_CHAT_ID_KEY,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return int(row[0]) if row else None
+
+
+def set_admin_chat_id(chat_id: int) -> None:
+    conn = _get_conn()
+    cur = conn.cursor()
+    value = str(chat_id)
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (ADMIN_CHAT_ID_KEY, value),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (ADMIN_CHAT_ID_KEY, value),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
 def _increment_stat(user_id: int, column: str) -> None:
     # column всегда один из захардкоженных литералов ниже (spins/jackpots/
     # purchases) — никогда не берётся из пользовательского ввода.
@@ -510,25 +562,79 @@ def get_stats(user_id: int) -> dict:
     return {"spins": row[0], "jackpots": row[1], "purchases": row[2]}
 
 
+TOP_USERS_LIMIT = 10
+
+
+def get_top_users(limit: int = TOP_USERS_LIMIT) -> list[dict]:
+    """Топ игроков за всё время по числу выбитых 777 (при равенстве —
+    по числу прокрутов). Возвращает [{"user_id", "spins", "jackpots"}, ...]."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id, spins, jackpots FROM user_stats "
+        "ORDER BY jackpots DESC, spins DESC LIMIT " + str(int(limit))
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"user_id": r[0], "spins": r[1], "jackpots": r[2]} for r in rows]
+
+
+def upsert_user_name(user_id: int, display_name: str) -> None:
+    """Запоминаем, как зовут пользователя — только чтобы красиво показать
+    имя в топе (/menu:top). Обновляется на каждый бросок 🎰 и /start."""
+    conn = _get_conn()
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        cur.execute(
+            "INSERT INTO user_names (user_id, display_name) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name",
+            (user_id, display_name),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO user_names (user_id, display_name) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET display_name = excluded.display_name",
+            (user_id, display_name),
+        )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+def get_user_name(user_id: int) -> str | None:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT display_name FROM user_names WHERE user_id = {placeholder}", (user_id,)
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] if row else None
+
+
 def create_purchase_request(
-    user_id: int, chat_id: int, item_id: str, item_name: str, price: int
+    user_id: int, username: str | None, chat_id: int, item_id: str,
+    item_name: str, price: int,
 ) -> int:
     conn = _get_conn()
     cur = conn.cursor()
     if USE_POSTGRES:
         cur.execute(
             "INSERT INTO purchase_requests "
-            "(user_id, chat_id, item_id, item_name, price, status) "
-            "VALUES (%s, %s, %s, %s, %s, 'pending') RETURNING id",
-            (user_id, chat_id, item_id, item_name, price),
+            "(user_id, username, chat_id, item_id, item_name, price, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, 'pending') RETURNING id",
+            (user_id, username, chat_id, item_id, item_name, price),
         )
         new_id = cur.fetchone()[0]
     else:
         cur.execute(
             "INSERT INTO purchase_requests "
-            "(user_id, chat_id, item_id, item_name, price, status) "
-            "VALUES (?, ?, ?, ?, ?, 'pending')",
-            (user_id, chat_id, item_id, item_name, price),
+            "(user_id, username, chat_id, item_id, item_name, price, status) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+            (user_id, username, chat_id, item_id, item_name, price),
         )
         new_id = cur.lastrowid
     conn.commit()
@@ -542,7 +648,7 @@ def get_purchase_request(request_id: int) -> dict | None:
     placeholder = "%s" if USE_POSTGRES else "?"
     cur = conn.cursor()
     cur.execute(
-        f"SELECT id, user_id, chat_id, item_id, item_name, price, status "
+        f"SELECT id, user_id, username, chat_id, item_id, item_name, price, status "
         f"FROM purchase_requests WHERE id = {placeholder}",
         (request_id,),
     )
@@ -552,8 +658,8 @@ def get_purchase_request(request_id: int) -> dict | None:
     if row is None:
         return None
     return {
-        "id": row[0], "user_id": row[1], "chat_id": row[2],
-        "item_id": row[3], "item_name": row[4], "price": row[5], "status": row[6],
+        "id": row[0], "user_id": row[1], "username": row[2], "chat_id": row[3],
+        "item_id": row[4], "item_name": row[5], "price": row[6], "status": row[7],
     }
 
 
@@ -673,7 +779,7 @@ def build_main_menu_text() -> str:
     )
 
 
-def build_shop_text(balance: int) -> str:
+def build_shop_text(user_id: int, username: str | None) -> str:
     lines = [
         f"{custom_emoji(EMOJI_STAR_FACE, '🤩')}Добро пожаловать в Магазин {SHOP_BRAND_NAME}!",
         "<u>Здесь ты можешь обменять свои звёзды на крутые подарки "
@@ -692,7 +798,10 @@ def build_shop_text(balance: int) -> str:
     item_lines.append(f"{custom_emoji(EMOJI_SHOP_FIRE, '🔥')} (Максимальная выгода!)")
 
     lines.append("<blockquote>" + "\n".join(item_lines) + "</blockquote>")
-    lines.append(f"{custom_emoji(EMOJI_COIN, '🪙')} Твой баланс: {balance} звёзд")
+    lines.append(
+        f"{custom_emoji(EMOJI_COIN, '🪙')} Твой баланс: "
+        f"{balance_display(user_id, username)}"
+    )
     lines.append("")
     lines.append(
         f"{custom_emoji(EMOJI_HOURGLASS, '⌛️')} Напоминание: При выводе призов "
@@ -755,15 +864,34 @@ def build_rejected_request_text(request_id: int, item_name: str, refund: int) ->
     )
 
 
-def build_profile_text(user_id: int, balance: int, stats: dict) -> str:
+def build_profile_text(user_id: int, username: str | None, stats: dict) -> str:
+    balance_line = (
+        "♾️" if has_infinite_balance(username) else str(get_balance(user_id))
+    )
     return (
         f"{custom_emoji(EMOJI_PROFILE_PERSON, '👤')} <b>Ваш профиль</b>\n\n"
         f"{custom_emoji(EMOJI_PROFILE_CARD, '💳')} ID: {user_id}\n"
-        f"{custom_emoji(EMOJI_STAR_JACKPOT, '⭐️')} Баланс: {balance}\n"
+        f"{custom_emoji(EMOJI_STAR_JACKPOT, '⭐️')} Баланс: {balance_line}\n"
         f"{custom_emoji(EMOJI_PROFILE_SLOT, '🎰')} Прокрутов всего: {stats['spins']}\n"
         f"{custom_emoji(EMOJI_PROFILE_CART, '🛒')} Покупок: {stats['purchases']}\n"
         f"{custom_emoji(EMOJI_SMILE, '😃')} Всего Джекпотов: {stats['jackpots']}"
     )
+
+
+def build_top_users_text() -> str:
+    top = get_top_users()
+    if not top:
+        return f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} Топ пока пуст — никто ещё не крутил 🎰."
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} <b>Топ игроков за всё время</b>\n"]
+    for i, row in enumerate(top, start=1):
+        name = get_user_name(row["user_id"]) or f"ID {row['user_id']}"
+        rank = medals[i - 1] if i <= 3 else f"{i}."
+        lines.append(
+            f"{rank} {name} — прокрутов: {row['spins']}, выбито 777: {row['jackpots']}"
+        )
+    return "\n".join(lines)
 
 
 def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
@@ -806,20 +934,30 @@ def range_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="Магазин",
-                callback_data="menu:shop",
-                icon_custom_emoji_id=BUTTON_ICONS["shop_menu"],
-                style="primary",
-            ),
-            InlineKeyboardButton(
-                text="Профиль",
-                callback_data="menu:profile",
-                icon_custom_emoji_id=BUTTON_ICONS["profile_menu"],
-                style="primary",
-            ),
-        ]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Магазин",
+                    callback_data="menu:shop",
+                    icon_custom_emoji_id=BUTTON_ICONS["shop_menu"],
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="Профиль",
+                    callback_data="menu:profile",
+                    icon_custom_emoji_id=BUTTON_ICONS["profile_menu"],
+                    style="primary",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Топ",
+                    callback_data="menu:top",
+                    icon_custom_emoji_id=BUTTON_ICONS["top_menu"],
+                    style="primary",
+                ),
+            ],
+        ]
     )
 
 
@@ -857,15 +995,22 @@ def admin_review_keyboard(request_id: int) -> InlineKeyboardMarkup:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    user = message.from_user
+    upsert_user_name(user.id, user.full_name)
+
+    # Если это админ пишет боту в личку впервые — запоминаем этот чат,
+    # чтобы слать сюда уведомления о новых заявках на вывод.
+    if message.chat.type == "private" and is_admin(user.username):
+        set_admin_chat_id(message.chat.id)
+
     await message.answer(build_main_menu_text(), reply_markup=main_menu_keyboard())
 
 
 @router.message(Command("profile"))
 async def cmd_profile(message: Message) -> None:
     user = message.from_user
-    balance = get_balance(user.id)
     stats = get_stats(user.id)
-    await message.reply(build_profile_text(user.id, balance, stats))
+    await message.reply(build_profile_text(user.id, user.username, stats))
 
 
 @router.message(Command("promo_on"))
@@ -924,8 +1069,8 @@ async def cmd_nft_on(message: Message) -> None:
 
 @router.callback_query(F.data == "menu:shop")
 async def handle_open_shop(callback: CallbackQuery) -> None:
-    balance = get_balance(callback.from_user.id)
-    text = build_shop_text(balance)
+    user = callback.from_user
+    text = build_shop_text(user.id, user.username)
     await callback.message.edit_text(text, reply_markup=shop_keyboard())
     await callback.answer()
 
@@ -933,9 +1078,15 @@ async def handle_open_shop(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "menu:profile")
 async def handle_open_profile(callback: CallbackQuery) -> None:
     user = callback.from_user
-    balance = get_balance(user.id)
     stats = get_stats(user.id)
-    text = build_profile_text(user.id, balance, stats)
+    text = build_profile_text(user.id, user.username, stats)
+    await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:top")
+async def handle_open_top(callback: CallbackQuery) -> None:
+    text = build_top_users_text()
     await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard())
     await callback.answer()
 
@@ -957,7 +1108,9 @@ async def handle_buy(callback: CallbackQuery) -> None:
         return
 
     user = callback.from_user
-    if not try_spend_balance(user.id, item["price"]):
+    unlimited = has_infinite_balance(user.username)
+
+    if not unlimited and not try_spend_balance(user.id, item["price"]):
         await callback.answer(
             f"Недостаточно звёзд для покупки «{item['name']}» "
             f"(нужно {item['price']}⭐).",
@@ -966,14 +1119,38 @@ async def handle_buy(callback: CallbackQuery) -> None:
         return
 
     request_id = create_purchase_request(
-        user.id, callback.message.chat.id, item["id"], item["name"], item["price"]
+        user.id, user.username, callback.message.chat.id,
+        item["id"], item["name"], item["price"],
     )
     await callback.answer("Заявка создана! Ждите подтверждения от администратора 🙂")
 
+    # Покупателю — просто информационное сообщение, БЕЗ кнопок одобрения.
     pending_text = build_pending_request_text(user.full_name, request_id, item["name"])
-    await callback.message.answer(
-        pending_text, reply_markup=admin_review_keyboard(request_id)
+    await callback.message.answer(pending_text)
+
+    # Админу — отдельное сообщение с кнопками, видимое только ему (в личку).
+    notify_text = (
+        f"🆕 Новая заявка на вывод\n\n"
+        f"Пользователь: {mention(user.id, user.full_name)} (ID: {user.id})\n"
+        f"Хочет получить: «{item['name']}» — {item['price']}⭐\n"
+        f"Заявка №{request_id}"
     )
+    admin_chat_id = get_admin_chat_id()
+    if admin_chat_id is not None:
+        try:
+            await callback.bot.send_message(
+                admin_chat_id, notify_text, reply_markup=admin_review_keyboard(request_id)
+            )
+        except Exception as e:
+            logging.error("Не удалось отправить заявку админу в личку: %s", e)
+    else:
+        # Админ ни разу не писал боту в личку — некуда слать уведомление.
+        # Логируем, чтобы не потерять заявку молча (сама заявка уже в БД).
+        logging.warning(
+            "admin_chat_id не задан — заявка №%s не отправлена в личку админу. "
+            "Админу нужно написать боту /start в личных сообщениях один раз.",
+            request_id,
+        )
 
 
 @router.callback_query(F.data.startswith("approve:"))
@@ -992,7 +1169,15 @@ async def handle_approve_request(callback: CallbackQuery) -> None:
     increment_purchases(req["user_id"])
 
     approved_text = build_approved_request_text(request_id, req["item_name"])
-    await callback.message.edit_text(approved_text)
+    try:
+        await callback.bot.send_message(req["chat_id"], approved_text)
+    except Exception as e:
+        logging.error("Не удалось уведомить покупателя об одобрении: %s", e)
+
+    await callback.message.edit_text(
+        f"✅ Заявка №{request_id} одобрена.\n"
+        f"Пользователь: ID {req['user_id']}, товар: «{req['item_name']}»"
+    )
     await callback.answer("Заявка одобрена ✅")
 
 
@@ -1009,20 +1194,37 @@ async def handle_reject_request(callback: CallbackQuery) -> None:
         return
 
     set_request_status(request_id, "rejected")
-    add_balance(req["user_id"], req["price"])  # возвращаем списанные звёзды
+    # Возвращаем звёзды, только если они реально были списаны (не безлимитник)
+    if not has_infinite_balance(req["username"]):
+        add_balance(req["user_id"], req["price"])
 
     rejected_text = build_rejected_request_text(request_id, req["item_name"], req["price"])
-    await callback.message.edit_text(rejected_text)
+    try:
+        await callback.bot.send_message(req["chat_id"], rejected_text)
+    except Exception as e:
+        logging.error("Не удалось уведомить покупателя об отказе: %s", e)
+
+    await callback.message.edit_text(
+        f"❌ Заявка №{request_id} отклонена.\n"
+        f"Пользователь: ID {req['user_id']}, товар: «{req['item_name']}»"
+    )
     await callback.answer("Заявка отклонена, звёзды возвращены")
 
 
 @router.message(F.dice.emoji == "🎰")
 async def handle_slot_machine(message: Message) -> None:
+    # В личных сообщениях с ботом слот-машина не работает — иначе тестовые
+    # или случайные броски в ЛС засчитывались бы как настоящая игра/777.
+    # Игра предполагается только в групповых чатах (например, чат для фарма).
+    if message.chat.type == "private":
+        return
+
     dice_value = message.dice.value
     user = message.from_user
+    upsert_user_name(user.id, user.full_name)
 
-    # Считаем каждый прокрут (для профиля /profile), независимо от результата —
-    # в том числе пересланные сообщения с броском.
+    # Считаем каждый прокрут (для профиля /profile и топа), независимо от
+    # результата — в том числе пересланные сообщения с броском.
     increment_spins(user.id)
 
     if dice_value != SLOT_JACKPOT_VALUE:
