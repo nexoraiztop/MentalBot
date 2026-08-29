@@ -38,7 +38,7 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 
 # Username админов для выдачи приза и подтверждения заявок в магазине (без @)
-ADMIN_USERNAMES = ["dol1ro"]
+ADMIN_USERNAMES = ["Nexoraizfuck"]
 SUPPORT_USERNAME = ADMIN_USERNAMES[0]  # кому писать по вопросам ("@ссылка" в текстах)
 
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
