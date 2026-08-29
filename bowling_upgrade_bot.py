@@ -41,6 +41,9 @@ logging.basicConfig(level=logging.INFO)
 ADMIN_USERNAMES = ["Nexoraizfuck"]
 SUPPORT_USERNAME = ADMIN_USERNAMES[0]  # кому писать по вопросам ("@ссылка" в текстах)
 
+# Username с безлимитным балансом (списание в магазине для них пропускается)
+INFINITE_BALANCE_USERNAMES = ["Nexoraizfuck"]
+
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
     "http://t.me/nft/ViceCream-157848",
@@ -594,6 +597,17 @@ def admins_line() -> str:
 
 def is_admin(username: str | None) -> bool:
     return username is not None and username in ADMIN_USERNAMES
+
+
+def has_infinite_balance(username: str | None) -> bool:
+    return username is not None and username in INFINITE_BALANCE_USERNAMES
+
+
+def balance_display(user_id: int, username: str | None) -> str:
+    """Строка для показа баланса в текстах — с учётом безлимита."""
+    if has_infinite_balance(username):
+        return "♾️ безлимит"
+    return f"{get_balance(user_id)} звёзд"
 
 
 def build_reminder_text() -> str:
