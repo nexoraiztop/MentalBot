@@ -44,6 +44,13 @@ SUPPORT_USERNAME = ADMIN_USERNAMES[0]  # кому писать по вопрос
 # Username с безлимитным балансом (списание в магазине для них пропускается)
 INFINITE_BALANCE_USERNAMES = ["Nexoraizfuck"]
 
+# Куда отправлять заявки на подтверждение покупки (с кнопками ✅/❌).
+# Раньше слали в личку первому админу, который написал боту /start.
+# Теперь — фиксированный чат: https://t.me/+15wIW64Uu0tmODNi
+# ВАЖНО: бот должен быть добавлен в этот чат и иметь право отправлять
+# сообщения (обычный участник этого достаточно, админ-права не нужны).
+ADMIN_REVIEW_CHAT_ID = -5357491635
+
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
     "http://t.me/nft/ViceCream-157848",
@@ -495,8 +502,9 @@ ADMIN_CHAT_ID_KEY = "admin_chat_id"
 
 
 def get_admin_chat_id() -> int | None:
-    """Личный чат админа с ботом, куда шлём заявки на вывод. Заполняется
-    автоматически, когда админ первый раз пишет боту /start в личку."""
+    """Личный чат админа с ботом — раньше сюда слали заявки на вывод.
+    Больше не используется для заявок (см. ADMIN_REVIEW_CHAT_ID), но
+    оставлено на будущее для других личных уведомлений админу."""
     conn = _get_conn()
     placeholder = "%s" if USE_POSTGRES else "?"
     cur = conn.cursor()
@@ -1170,8 +1178,9 @@ async def cmd_start(message: Message) -> None:
     user = message.from_user
     upsert_user_name(user.id, user.full_name)
 
-    # Если это админ пишет боту в личку впервые — запоминаем этот чат,
-    # чтобы слать сюда уведомления о новых заявках на вывод.
+    # Если это админ пишет боту в личку впервые — запоминаем этот чат.
+    # (Заявки на вывод теперь идут в ADMIN_REVIEW_CHAT_ID, но этот чат
+    # оставлен на будущее для других личных уведомлений админу.)
     if message.chat.type == "private" and is_admin(user.username):
         set_admin_chat_id(message.chat.id)
 
@@ -1300,28 +1309,23 @@ async def handle_buy(callback: CallbackQuery) -> None:
     pending_text = build_pending_request_text(user.full_name, request_id, item["name"])
     await callback.message.answer(pending_text)
 
-    # Админу — отдельное сообщение с кнопками, видимое только ему (в личку).
+    # Заявка на подтверждение теперь всегда уходит в общий чат админов
+    # (ADMIN_REVIEW_CHAT_ID), а не в личку первому написавшему боту админу.
     notify_text = (
         f"🆕 Новая заявка на вывод\n\n"
         f"Пользователь: {mention(user.id, user.full_name)} (ID: {user.id})\n"
         f"Хочет получить: «{item['name']}» — {item['price']}⭐\n"
         f"Заявка №{request_id}"
     )
-    admin_chat_id = get_admin_chat_id()
-    if admin_chat_id is not None:
-        try:
-            await callback.bot.send_message(
-                admin_chat_id, notify_text, reply_markup=admin_review_keyboard(request_id)
-            )
-        except Exception as e:
-            logging.error("Не удалось отправить заявку админу в личку: %s", e)
-    else:
-        # Админ ни разу не писал боту в личку — некуда слать уведомление.
-        # Логируем, чтобы не потерять заявку молча (сама заявка уже в БД).
-        logging.warning(
-            "admin_chat_id не задан — заявка №%s не отправлена в личку админу. "
-            "Админу нужно написать боту /start в личных сообщениях один раз.",
-            request_id,
+    try:
+        await callback.bot.send_message(
+            ADMIN_REVIEW_CHAT_ID, notify_text, reply_markup=admin_review_keyboard(request_id)
+        )
+    except Exception as e:
+        logging.error(
+            "Не удалось отправить заявку №%s в чат ADMIN_REVIEW_CHAT_ID (%s): %s. "
+            "Проверьте, что бот добавлен в этот чат и может писать сообщения.",
+            request_id, ADMIN_REVIEW_CHAT_ID, e,
         )
 
 
