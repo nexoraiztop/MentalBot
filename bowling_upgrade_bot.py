@@ -47,7 +47,7 @@ INFINITE_BALANCE_USERNAMES = ["Nexoraizfuck"]
 # Ссылки на NFT-подарки (финальный уровень лестницы призов)
 rewards_list = [
     "http://t.me/nft/XmasStocking-169190",
-    "https://t.me/nft/ChillFlame-64612
+    "https://t.me/nft/ChillFlame-64612"
 ]
 
 # ID премиум-эмодзи, по местам использования
