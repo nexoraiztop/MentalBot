@@ -289,6 +289,13 @@ def init_db() -> None:
             "status TEXT NOT NULL DEFAULT 'pending'"
             ")"
         )
+        # Миграция для БД, созданных до появления статистики трат:
+        # добавляем колонку, только если её ещё нет (Postgres поддерживает
+        # IF NOT EXISTS для ADD COLUMN напрямую).
+        cur.execute(
+            "ALTER TABLE purchase_requests "
+            "ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+        )
     else:
         cur.execute(
             "CREATE TABLE IF NOT EXISTS balances ("
@@ -333,6 +340,15 @@ def init_db() -> None:
             "status TEXT NOT NULL DEFAULT 'pending'"
             ")"
         )
+        # SQLite не поддерживает "ADD COLUMN IF NOT EXISTS" — ловим ошибку,
+        # если колонка уже есть (например, после первого запуска этой версии).
+        try:
+            cur.execute(
+                "ALTER TABLE purchase_requests "
+                "ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            )
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     cur.close()
     conn.close()
@@ -676,6 +692,90 @@ def set_request_status(request_id: int, status: str) -> None:
     conn.close()
 
 
+def _infinite_exclusion_sql(placeholder: str) -> tuple[str, list]:
+    """SQL-условие, исключающее покупки безлимитных пользователей из
+    статистики трат (у них ничего реально не списывалось)."""
+    if not INFINITE_BALANCE_USERNAMES:
+        return "", []
+    placeholders = ", ".join([placeholder] * len(INFINITE_BALANCE_USERNAMES))
+    return f" AND (username IS NULL OR username NOT IN ({placeholders}))", list(
+        INFINITE_BALANCE_USERNAMES
+    )
+
+
+def get_spent_today(user_id: int) -> int:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    excl_sql, excl_params = _infinite_exclusion_sql(placeholder)
+    cur = conn.cursor()
+    if USE_POSTGRES:
+        query = (
+            f"SELECT COALESCE(SUM(price), 0) FROM purchase_requests "
+            f"WHERE user_id = {placeholder} AND status != 'rejected' "
+            f"AND created_at::date = CURRENT_DATE{excl_sql}"
+        )
+    else:
+        query = (
+            f"SELECT COALESCE(SUM(price), 0) FROM purchase_requests "
+            f"WHERE user_id = {placeholder} AND status != 'rejected' "
+            f"AND date(created_at) = date('now'){excl_sql}"
+        )
+    cur.execute(query, [user_id] + excl_params)
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] or 0
+
+
+def get_spent_total(user_id: int) -> int:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    excl_sql, excl_params = _infinite_exclusion_sql(placeholder)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT COALESCE(SUM(price), 0) FROM purchase_requests "
+        f"WHERE user_id = {placeholder} AND status != 'rejected'{excl_sql}",
+        [user_id] + excl_params,
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] or 0
+
+
+def get_spent_chat_total() -> int:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    excl_sql, excl_params = _infinite_exclusion_sql(placeholder)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT COALESCE(SUM(price), 0) FROM purchase_requests "
+        f"WHERE status != 'rejected'{excl_sql}",
+        excl_params,
+    )
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] or 0
+
+
+def get_top_spenders(limit: int = 10) -> list[dict]:
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    excl_sql, excl_params = _infinite_exclusion_sql(placeholder)
+    cur = conn.cursor()
+    cur.execute(
+        f"SELECT user_id, SUM(price) AS total FROM purchase_requests "
+        f"WHERE status != 'rejected'{excl_sql} "
+        f"GROUP BY user_id ORDER BY total DESC LIMIT " + str(int(limit)),
+        excl_params,
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"user_id": r[0], "spent": r[1]} for r in rows]
+
+
 router = Router()
 
 # Активные игры: game_id -> {"user_id", "level", "chat_id"}
@@ -878,19 +978,91 @@ def build_profile_text(user_id: int, username: str | None, stats: dict) -> str:
     )
 
 
-def build_top_users_text() -> str:
+# ID премиум-эмодзи для мест в топе (1-9). Позиции 10+ (если увеличишь
+# TOP_USERS_LIMIT) используют обычный юникод-номер как фолбэк.
+TOP_POSITION_EMOJI = {
+    1: "5440539497383087970",  # 🥇
+    2: "5447203607294265305",  # 🥈
+    3: "5453902265922376865",  # 🥉
+    4: "5435882198056060129",  # 4️⃣
+    5: "5447616284931933807",  # 5️⃣
+    6: "5447377755333214518",  # 6️⃣
+    7: "5447609687862165448",  # 7️⃣
+    8: "5447218643974767663",  # 8️⃣
+    9: "5447303753046703974",  # 9️⃣
+}
+EMOJI_TOP_SPINS_STAR = "5931513401015539048"  # ⭐️ после "прокрутов" (и после "потрачено")
+EMOJI_TOP_SEVEN = "4938373072185984758"       # 7️⃣ "выбито 777" (x3)
+
+
+def top_rank_emoji(position: int) -> str:
+    """Значок места в топе с фолбэком на обычный номер (10+ мест)."""
+    fallback_num = f"{position}\uFE0F\u20E3" if position <= 9 else f"{position}."
+    rank_id = TOP_POSITION_EMOJI.get(position)
+    return custom_emoji(rank_id, fallback_num) if rank_id else f"{position}."
+
+
+async def get_display_name(bot: Bot, user_id: int) -> str:
+    """Имя для показа в топах — сначала кэш, если пусто — спрашиваем
+    у Telegram напрямую и запоминаем на будущее."""
+    name = get_user_name(user_id)
+    if name is not None:
+        return name
+    try:
+        chat = await bot.get_chat(user_id)
+        name = chat.full_name or f"ID {user_id}"
+        upsert_user_name(user_id, name)
+    except Exception:
+        name = f"ID {user_id}"
+    return name
+
+
+async def build_top_users_text(bot: Bot) -> str:
     top = get_top_users()
     if not top:
         return f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} Топ пока пуст — никто ещё не крутил 🎰."
 
-    medals = ["🥇", "🥈", "🥉"]
-    lines = [f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} <b>Топ игроков за всё время</b>\n"]
+    lines = [f"{custom_emoji(EMOJI_R_TROPHY, '🏆')} Топ игроков за всё время\n"]
     for i, row in enumerate(top, start=1):
-        name = get_user_name(row["user_id"]) or f"ID {row['user_id']}"
-        rank = medals[i - 1] if i <= 3 else f"{i}."
+        name = await get_display_name(bot, row["user_id"])
+        rank = top_rank_emoji(i)
+        sevens = custom_emoji(EMOJI_TOP_SEVEN, "7️⃣") * 3
+        star = custom_emoji(EMOJI_TOP_SPINS_STAR, "⭐️")
+
         lines.append(
-            f"{rank} {name} — прокрутов: {row['spins']}, выбито 777: {row['jackpots']}"
+            f"{rank} {name} — прокрутов{star}: {row['spins']}, "
+            f"выбито {sevens}: {row['jackpots']}"
         )
+    return "\n".join(lines)
+
+
+async def build_spending_stats_text(bot: Bot, user_id: int, username: str | None) -> str:
+    if has_infinite_balance(username):
+        spent_today = 0
+        spent_total = 0
+    else:
+        spent_today = get_spent_today(user_id)
+        spent_total = get_spent_total(user_id)
+    chat_total = get_spent_chat_total()
+
+    lines = [
+        f"👤 Вы сегодня потратили: {spent_today}🌟",
+        f"Вы всего потратили: {spent_total} 🌟",
+        f"🌟 Всего потратил чат: {chat_total} 🌟",
+        "",
+        f"🏆 Топ 10 по звёздам: в чате @{FARM_CHAT_USERNAME}",
+    ]
+
+    top = get_top_spenders()
+    if not top:
+        lines.append("Пока никто ничего не покупал.")
+    else:
+        star = custom_emoji(EMOJI_TOP_SPINS_STAR, "⭐️")
+        for i, row in enumerate(top, start=1):
+            name = await get_display_name(bot, row["user_id"])
+            rank = top_rank_emoji(i)
+            lines.append(f"{rank} {name} — потрачено{star}: {row['spent']}")
+
     return "\n".join(lines)
 
 
@@ -1086,7 +1258,7 @@ async def handle_open_profile(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "menu:top")
 async def handle_open_top(callback: CallbackQuery) -> None:
-    text = build_top_users_text()
+    text = await build_top_users_text(callback.bot)
     await callback.message.edit_text(text, reply_markup=back_to_menu_keyboard())
     await callback.answer()
 
