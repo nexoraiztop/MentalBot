@@ -16,6 +16,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 import uuid
 
@@ -44,9 +45,15 @@ SUPPORT_USERNAME = ADMIN_USERNAMES[0]  # кому писать по вопрос
 # Username с безлимитным балансом (списание в магазине для них пропускается)
 INFINITE_BALANCE_USERNAMES = ["Nexoraizfuck"]
 
-# Ссылки на NFT-подарки (финальный уровень лестницы призов)
-rewards_list = [
-    "https://t.me/nft/CloverPin-223288"
+# Куда отправлять заявки на подтверждение покупки (с кнопками ✅/❌).
+ADMIN_REVIEW_CHAT_ID = -5357491635
+
+# Стартовые ссылки на NFT-подарки — используются только один раз, чтобы
+# заполнить таблицу rewards в БД при самом первом запуске (если она пустая).
+# Дальше список наград управляется через личку с ботом (см. /rewards,
+# /remove и пересылку подарков — секция "УПРАВЛЕНИЕ НАГРАДАМИ" ниже).
+DEFAULT_REWARDS = [
+    "https://t.me/nft/ChillFlame-64612",
 ]
 
 # ID премиум-эмодзи, по местам использования
@@ -118,27 +125,14 @@ EMOJI_PROFILE_CARD = "5445353829304387411"     # 💳 ID
 EMOJI_PROFILE_SLOT = "4938599077660068007"     # 🎰 "Прокрутов всего"
 EMOJI_PROFILE_CART = "5312361253610475399"     # 🛒 "Покупок"
 
-# ==== ПРЕМ ЭМОДЗИ НА КНОПКАХ ====
-# Единая "приборная панель" для иконок на инлайн-кнопках (параметр
-# icon_custom_emoji_id у InlineKeyboardButton, Bot API 9.4+ / aiogram 3.20+).
-# Хочешь поменять иконку на конкретной кнопке — меняй ID здесь, ничего
-# больше в коде трогать не нужно. Иконка реально отрисуется только если у
-# ВЛАДЕЛЬЦА БОТА активна Telegram Premium — иначе Telegram молча покажет
-# только текст кнопки без иконки.
-#
-# Иконки товаров магазина сюда не входят — они у каждого товара свои,
-# заданы в поле "emoji_id" внутри списка SHOP_ITEMS (см. ниже по файлу).
-BUTTON_ICONS = {
-    "claim": "5280615440928758599",  # 🎁 "Забрать ..." (на любом уровне лесенки)
-    "risk": "5280922999241859582",   # 💎 "Испытать удачу"
-    "range": EMOJI_SIX,              # 6️⃣ кнопки диапазона (1-3, 4-6, 1-2 и т.д.)
-    "shop_menu": EMOJI_COIN,         # 🪙 кнопка "Магазин" в главном меню
-    "profile_menu": EMOJI_PROFILE_PERSON,  # 👤 кнопка "Профиль" в главном меню
-    "top_menu": EMOJI_R_TROPHY,      # 🏆 кнопка "Топ" в главном меню
-}
-# Хочешь новую иконку на какой-то из этих кнопок — просто впиши сюда новый
-# ID строкой (или замени ссылку на константу типа EMOJI_SIX/EMOJI_COIN
-# выше), больше нигде в файле трогать не нужно.
+# ==== ЭМОДЗИ НА КНОПКАХ ====
+# icon_custom_emoji_id (Bot API 9.4+) в целом работает на этом боте —
+# используется на кнопках "Забрать"/"Испытать удачу", диапазона и
+# главного меню. Единственное исключение — кнопки товаров в магазине:
+# ID EMOJI_SHOP_BEAR/ROCKET/DIAMOND оказались невалидными именно для
+# кнопок (в тексте это незаметно — там при плохом ID тихо показывается
+# юникод-фолбэк), поэтому на кнопках магазина используется обычный
+# юникод-эмодзи из поля "emoji" каждого товара (см. shop_keyboard()).
 
 # Как часто слать напоминание, пока оно включено (в секундах)
 REMINDER_INTERVAL_SECONDS = 60 * 60  # 1 час
@@ -192,14 +186,18 @@ SHOP_REWARD_PER_JACKPOT = 20
 SHOP_BRAND_NAME = "nexoraiza"
 FARM_CHAT_USERNAME = "mentalLudo"
 
+# Юзернейм бота, который упоминается в сообщении о заборе приза
+# ("Дешёвые звёзды тут: @...") — без символа @.
+CHEAP_STARS_BOT_USERNAME = "sheper_Starsbot"
+
 # Сколько примерно ждать: используется в текстах заявки на покупку
 REVIEW_WAIT_TEXT = "5-15 минут"     # пока заявка "в обработке" у админа
 DELAY_MIN_TEXT = "10 минут"         # после одобрения — минимальный срок зачисления
 DELAY_MAX_TEXT = "24 часов"         # после одобрения — максимальный срок зачисления
 
 # Товары магазина: одиночные и "рядами" (по 3шт со скидкой).
-# emoji_id используется и на кнопках покупки (icon_custom_emoji_id),
-# и в тексте витрины (build_shop_text).
+# emoji_id используется в тексте витрины (build_shop_text); "emoji" —
+# обычный юникод-фолбэк, который также идёт на кнопки покупки.
 SHOP_ITEMS = [
     {"id": "bear", "emoji_id": EMOJI_SHOP_BEAR, "emoji": "🧸", "name": "Мишка",
      "price": 250, "qty": 1, "note": "(Самый невыгодный вариант)"},
@@ -215,8 +213,10 @@ SHOP_ITEMS = [
      "price": 3000, "qty": 3, "note": ""},
 ]
 
-# Баланс, статистика и заявки на покупку хранятся в базе данных, а не в
-# памяти процесса — иначе всё обнулялось бы при каждом редеплое.
+# Баланс, статистика, заявки на покупку и список наград хранятся в базе
+# данных, а не в памяти процесса и не в обычном файле — на Railway
+# файловая система эфемерна и стирается при каждом редеплое (Volume для
+# этого не нужен — просто используем персистентный сервис Postgres).
 #
 # Если Railway даёт переменную DATABASE_URL (после того как в проект добавлен
 # сервис PostgreSQL) — используем Postgres, он персистентный и переживает
@@ -288,6 +288,13 @@ def init_db() -> None:
             "status TEXT NOT NULL DEFAULT 'pending'"
             ")"
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS rewards ("
+            "id SERIAL PRIMARY KEY, "
+            "url TEXT NOT NULL UNIQUE, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
         # Миграция для БД, созданных до появления статистики трат:
         # добавляем колонку, только если её ещё нет (Postgres поддерживает
         # IF NOT EXISTS для ADD COLUMN напрямую).
@@ -339,6 +346,13 @@ def init_db() -> None:
             "status TEXT NOT NULL DEFAULT 'pending'"
             ")"
         )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS rewards ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "url TEXT NOT NULL UNIQUE, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+            ")"
+        )
         # SQLite не поддерживает "ADD COLUMN IF NOT EXISTS" — ловим ошибку,
         # если колонка уже есть (например, после первого запуска этой версии).
         try:
@@ -350,6 +364,17 @@ def init_db() -> None:
             pass
     conn.commit()
     cur.close()
+
+    # Если таблица наград только что создана и пуста — заполняем стартовыми
+    # значениями по умолчанию (только один раз, при самом первом запуске).
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM rewards")
+    count = cur.fetchone()[0]
+    cur.close()
+    if count == 0:
+        for url in DEFAULT_REWARDS:
+            _insert_reward(conn, url)
+
     conn.close()
 
     logging.info(
@@ -494,8 +519,9 @@ ADMIN_CHAT_ID_KEY = "admin_chat_id"
 
 
 def get_admin_chat_id() -> int | None:
-    """Личный чат админа с ботом, куда шлём заявки на вывод. Заполняется
-    автоматически, когда админ первый раз пишет боту /start в личку."""
+    """Личный чат админа с ботом — раньше сюда слали заявки на вывод.
+    Больше не используется для заявок (см. ADMIN_REVIEW_CHAT_ID), но
+    оставлено на будущее для других личных уведомлений админу."""
     conn = _get_conn()
     placeholder = "%s" if USE_POSTGRES else "?"
     cur = conn.cursor()
@@ -775,6 +801,101 @@ def get_top_spenders(limit: int = 10) -> list[dict]:
     return [{"user_id": r[0], "spent": r[1]} for r in rows]
 
 
+# ==== УПРАВЛЕНИЕ НАГРАДАМИ (NFT) ====
+# Список ссылок на NFT-подарки хранится в таблице rewards (см. init_db
+# выше) и управляется админами через личные сообщения боту:
+#   /rewards          — показать список
+#   /remove <номер>   — убрать по номеру
+#   переслать подарок или прислать ссылку текстом — добавить
+# См. хендлеры handle_admin_dm_gift / handle_admin_dm_link / cmd_rewards /
+# cmd_remove_reward ниже.
+
+def _insert_reward(conn, url: str) -> bool:
+    """Вставляет ссылку, если её ещё нет (ловим конфликт уникальности).
+    Возвращает True, если реально добавили, False — если уже была."""
+    cur = conn.cursor()
+    try:
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO rewards (url) VALUES (%s) ON CONFLICT (url) DO NOTHING",
+                (url,),
+            )
+        else:
+            cur.execute("INSERT OR IGNORE INTO rewards (url) VALUES (?)", (url,))
+        added = cur.rowcount > 0
+        conn.commit()
+    finally:
+        cur.close()
+    return added
+
+
+def get_rewards() -> list[str]:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT url FROM rewards ORDER BY id")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def add_reward_db(url: str) -> bool:
+    """Возвращает True, если ссылка реально добавлена, False — если уже была в списке."""
+    conn = _get_conn()
+    try:
+        return _insert_reward(conn, url)
+    finally:
+        conn.close()
+
+
+def remove_reward_by_index(index: int) -> str | None:
+    """index — 0-based позиция в списке, отсортированном как в get_rewards().
+    Возвращает удалённый url или None, если индекс вне диапазона."""
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute("SELECT id, url FROM rewards ORDER BY id")
+    rows = cur.fetchall()
+    if index < 0 or index >= len(rows):
+        cur.close()
+        conn.close()
+        return None
+    reward_id, url = rows[index]
+    cur.execute(f"DELETE FROM rewards WHERE id = {placeholder}", (reward_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+    return url
+
+
+def remove_reward_by_url(url: str) -> None:
+    """Убирает конкретную ссылку из наград — используется после того, как
+    её выдали обычному (не-админскому) победителю, чтобы одна и та же
+    NFT-награда не досталась двум разным людям."""
+    conn = _get_conn()
+    placeholder = "%s" if USE_POSTGRES else "?"
+    cur = conn.cursor()
+    cur.execute(f"DELETE FROM rewards WHERE url = {placeholder}", (url,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+
+# Ищем t.me/nft/<slug> где угодно в тексте — пересланные сообщения часто
+# содержат ссылку БЕЗ "https://" в начале (просто "t.me/nft/..."), поэтому
+# проверка на префикс http(s):// пропускала бы такие ссылки мимо.
+NFT_LINK_RE = re.compile(r"(?:https?://)?t\.me/nft/([A-Za-z0-9_\-]+)", re.IGNORECASE)
+
+
+def extract_nft_link(text: str) -> str | None:
+    """Возвращает нормализованную ссылку https://t.me/nft/<slug>, если она
+    есть в тексте (в любом виде — с http(s):// или без), иначе None."""
+    match = NFT_LINK_RE.search(text)
+    if not match:
+        return None
+    return f"https://t.me/nft/{match.group(1)}"
+
+
 router = Router()
 
 # Активные игры: game_id -> {"user_id", "level", "chat_id"}
@@ -802,6 +923,13 @@ def admins_line() -> str:
 
 def is_admin(username: str | None) -> bool:
     return username is not None and username in ADMIN_USERNAMES
+
+
+def is_allowed_chat(chat) -> bool:
+    """Игра (слот-машина) и рекламные напоминания работают только в этом
+    чате — @FARM_CHAT_USERNAME (сейчас это @mentalLudo). Если бота добавят
+    в любой другой чат, эти функции там просто молчат."""
+    return chat.username is not None and chat.username.lower() == FARM_CHAT_USERNAME.lower()
 
 
 def has_infinite_balance(username: str | None) -> bool:
@@ -875,6 +1003,15 @@ def build_main_menu_text() -> str:
         f"свой счет!</blockquote>\n"
         f"{custom_emoji(EMOJI_MENU_DIAMOND, '💎')} Выбери нужное действие на кнопках "
         f"ниже{custom_emoji(EMOJI_POINT_DOWN, '👇')}:"
+    )
+
+
+def build_admin_rewards_help_text() -> str:
+    return (
+        "🛠 Управление наградами (NFT) — доступно только тебе, здесь, в личке:\n\n"
+        "/rewards — показать список ссылок на NFT-награды\n"
+        "Перешли сюда подарок (NFT) или пришли ссылку текстом — добавится в список\n"
+        "/remove <номер> — убрать ссылку по номеру из /rewards"
     )
 
 
@@ -1072,7 +1209,7 @@ def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text=f"Забрать {prize['label']}",
             callback_data=f"claim:{game_id}",
-            icon_custom_emoji_id=BUTTON_ICONS["claim"],
+            icon_custom_emoji_id=EMOJI_R_GIFT,
             style="success",
         )
     ]
@@ -1082,7 +1219,7 @@ def prize_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text="Испытать удачу",
                 callback_data=f"risk:{game_id}",
-                icon_custom_emoji_id=BUTTON_ICONS["risk"],
+                icon_custom_emoji_id=EMOJI_R_TARGET,
                 style="primary",
             )
         )
@@ -1095,7 +1232,7 @@ def range_keyboard(game_id: str, level: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton(
             text=f"{lo}-{hi}",
             callback_data=f"range:{game_id}:{lo}:{hi}",
-            icon_custom_emoji_id=BUTTON_ICONS["range"],
+            icon_custom_emoji_id=EMOJI_SIX,
             style="primary",
         )
         for lo, hi in options
@@ -1110,13 +1247,13 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Магазин",
                     callback_data="menu:shop",
-                    icon_custom_emoji_id=BUTTON_ICONS["shop_menu"],
+                    icon_custom_emoji_id=EMOJI_COIN,
                     style="primary",
                 ),
                 InlineKeyboardButton(
                     text="Профиль",
                     callback_data="menu:profile",
-                    icon_custom_emoji_id=BUTTON_ICONS["profile_menu"],
+                    icon_custom_emoji_id=EMOJI_PROFILE_PERSON,
                     style="primary",
                 ),
             ],
@@ -1124,7 +1261,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Топ",
                     callback_data="menu:top",
-                    icon_custom_emoji_id=BUTTON_ICONS["top_menu"],
+                    icon_custom_emoji_id=EMOJI_R_TROPHY,
                     style="primary",
                 ),
             ],
@@ -1139,14 +1276,19 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
 
 
 def shop_keyboard() -> InlineKeyboardMarkup:
+    # ВНИМАНИЕ: emoji_id товаров (EMOJI_SHOP_BEAR/ROCKET/DIAMOND) не
+    # используем как icon_custom_emoji_id — эти конкретные ID оказались
+    # невалидными для кнопок (вместо иконки Telegram рисует заглушку).
+    # В тексте это не было заметно, т.к. там при плохом ID просто тихо
+    # показывается юникод-фолбэк. Пока не подставишь сюда рабочие ID —
+    # используем обычный юникод-эмодзи прямо в тексте кнопки.
     buttons = [
         [
             InlineKeyboardButton(
-                text=f"{item['name']}"
+                text=f"{item['emoji']} {item['name']}"
                 + (f" x{item['qty']}" if item["qty"] > 1 else "")
                 + f" — {item['price']}⭐",
                 callback_data=f"buy:{item['id']}",
-                icon_custom_emoji_id=item["emoji_id"],
             )
         ]
         for item in SHOP_ITEMS
@@ -1169,12 +1311,16 @@ async def cmd_start(message: Message) -> None:
     user = message.from_user
     upsert_user_name(user.id, user.full_name)
 
-    # Если это админ пишет боту в личку впервые — запоминаем этот чат,
-    # чтобы слать сюда уведомления о новых заявках на вывод.
+    # Если это админ пишет боту в личку впервые — запоминаем этот чат.
+    # (Заявки на вывод теперь идут в ADMIN_REVIEW_CHAT_ID, но этот чат
+    # оставлен на будущее для других личных уведомлений админу.)
     if message.chat.type == "private" and is_admin(user.username):
         set_admin_chat_id(message.chat.id)
 
     await message.answer(build_main_menu_text(), reply_markup=main_menu_keyboard())
+
+    if message.chat.type == "private" and is_admin(user.username):
+        await message.answer(build_admin_rewards_help_text())
 
 
 @router.message(Command("profile"))
@@ -1186,6 +1332,9 @@ async def cmd_profile(message: Message) -> None:
 
 @router.message(Command("promo_on"))
 async def cmd_promo_on(message: Message) -> None:
+    if not is_allowed_chat(message.chat):
+        return
+
     chat_id = message.chat.id
     if chat_id in reminder_tasks:
         await message.reply("Напоминание уже запущено в этом чате ✅")
@@ -1236,6 +1385,92 @@ async def cmd_nft_on(message: Message) -> None:
         return
     set_nft_enabled(True)
     await message.reply("✅ Режим NFT снова включён.")
+
+
+@router.message(Command("rewards"))
+async def cmd_rewards(message: Message) -> None:
+    # Список наград — админская информация, показываем только в личке админам.
+    if message.chat.type != "private" or not is_admin(message.from_user.username):
+        return
+
+    rewards = get_rewards()
+    if not rewards:
+        await message.reply("Список наград пуст.")
+        return
+
+    lines = ["🎁 Текущие ссылки на награды:\n"]
+    for i, url in enumerate(rewards, start=1):
+        lines.append(f"{i}. {url}")
+    lines.append("\nЧтобы убрать ссылку: /remove <номер>")
+    await message.reply("\n".join(lines))
+
+
+@router.message(Command("remove"))
+async def cmd_remove_reward(message: Message) -> None:
+    if message.chat.type != "private" or not is_admin(message.from_user.username):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.reply("Использование: /remove <номер> (номер бери из /rewards)")
+        return
+
+    index = int(parts[1].strip()) - 1
+    removed = remove_reward_by_index(index)
+    if removed is None:
+        await message.reply("Нет ссылки с таким номером. Посмотри актуальный список: /rewards")
+        return
+
+    await message.reply(f"✅ Удалено: {removed}\nОсталось наград: {len(get_rewards())}")
+
+
+async def add_reward(message: Message, url: str) -> None:
+    """Общая логика добавления ссылки в награды — используется и для
+    текстовых ссылок, и для настоящих пересланных Telegram-подарков."""
+    added = add_reward_db(url)
+    if not added:
+        await message.reply("Такая ссылка уже есть в списке наград.")
+        return
+    await message.reply(f"✅ Добавлено в награды: {url}\nВсего наград: {len(get_rewards())}")
+
+
+@router.message(F.chat.type == "private", F.unique_gift)
+async def handle_admin_dm_gift(message: Message) -> None:
+    """Админ пересылает/отправляет боту НАСТОЯЩИЙ Telegram-подарок (NFT).
+    Такое сообщение не содержит message.text — Telegram передаёт его через
+    отдельное поле unique_gift (Bot API: UniqueGiftInfo). Слаг из
+    unique_gift.gift.name — это ровно то, что идёт в ссылку t.me/nft/<slug>.
+    """
+    if not is_admin(message.from_user.username):
+        return
+
+    slug = message.unique_gift.gift.name
+    url = f"https://t.me/nft/{slug}"
+    await add_reward(message, url)
+
+
+@router.message(F.chat.type == "private", F.text)
+async def handle_admin_dm_link(message: Message) -> None:
+    """Админ присылает ссылку ТЕКСТОМ или пересылает сообщение со ссылкой
+    (например, форвард поста с t.me/nft/... — часто БЕЗ "https://" в
+    начале). Настоящие "живые" подарки, отправленные боту напрямую (не
+    форвардом), ловит handle_admin_dm_gift выше."""
+    if not is_admin(message.from_user.username):
+        return
+    if message.text.startswith("/"):
+        return  # неизвестная команда — не пытаемся трактовать как ссылку
+
+    url = extract_nft_link(message.text)
+    if url is None:
+        # Не t.me/nft-ссылка — на всякий случай всё равно принимаем обычный
+        # http(s)-адрес целиком (например, не-NFT награду добавили вручную).
+        stripped = message.text.strip()
+        if stripped.startswith("http://") or stripped.startswith("https://"):
+            url = stripped
+    if url is None:
+        return  # в тексте нет распознаваемой ссылки — игнорируем
+
+    await add_reward(message, url)
 
 
 @router.callback_query(F.data == "menu:shop")
@@ -1299,28 +1534,22 @@ async def handle_buy(callback: CallbackQuery) -> None:
     pending_text = build_pending_request_text(user.full_name, request_id, item["name"])
     await callback.message.answer(pending_text)
 
-    # Админу — отдельное сообщение с кнопками, видимое только ему (в личку).
+    # Заявка на подтверждение уходит в общий чат админов (ADMIN_REVIEW_CHAT_ID).
     notify_text = (
         f"🆕 Новая заявка на вывод\n\n"
         f"Пользователь: {mention(user.id, user.full_name)} (ID: {user.id})\n"
         f"Хочет получить: «{item['name']}» — {item['price']}⭐\n"
         f"Заявка №{request_id}"
     )
-    admin_chat_id = get_admin_chat_id()
-    if admin_chat_id is not None:
-        try:
-            await callback.bot.send_message(
-                admin_chat_id, notify_text, reply_markup=admin_review_keyboard(request_id)
-            )
-        except Exception as e:
-            logging.error("Не удалось отправить заявку админу в личку: %s", e)
-    else:
-        # Админ ни разу не писал боту в личку — некуда слать уведомление.
-        # Логируем, чтобы не потерять заявку молча (сама заявка уже в БД).
-        logging.warning(
-            "admin_chat_id не задан — заявка №%s не отправлена в личку админу. "
-            "Админу нужно написать боту /start в личных сообщениях один раз.",
-            request_id,
+    try:
+        await callback.bot.send_message(
+            ADMIN_REVIEW_CHAT_ID, notify_text, reply_markup=admin_review_keyboard(request_id)
+        )
+    except Exception as e:
+        logging.error(
+            "Не удалось отправить заявку №%s в чат ADMIN_REVIEW_CHAT_ID (%s): %s. "
+            "Проверьте, что бот добавлен в этот чат и может писать сообщения.",
+            request_id, ADMIN_REVIEW_CHAT_ID, e,
         )
 
 
@@ -1390,6 +1619,11 @@ async def handle_slot_machine(message: Message) -> None:
     if message.chat.type == "private":
         return
 
+    # Игра работает только в одном конкретном чате — @FARM_CHAT_USERNAME.
+    # Если бота добавят в любой другой чат/группу, слот-машина там молчит.
+    if not is_allowed_chat(message.chat):
+        return
+
     dice_value = message.dice.value
     user = message.from_user
     upsert_user_name(user.id, user.full_name)
@@ -1445,17 +1679,32 @@ async def handle_claim(callback: CallbackQuery) -> None:
     user = callback.from_user
 
     if prize["is_nft"]:
-        reward_url = random.choice(rewards_list)
+        rewards = get_rewards()
+        if not rewards:
+            await callback.answer(
+                "Награды сейчас закончились — обратитесь к администратору.",
+                show_alert=True,
+            )
+            return
+
+        reward_url = random.choice(rewards)
         text = (
             f"🎊 Поздравляем, {mention(user.id, user.full_name)}! Ты выиграл NFT!\n\n"
             f"🎁 {reward_url}\n\n"
             f"За выдачей пишите: {admins_line()}"
         )
+
+        if not is_admin(user.username):
+            # Обычному игроку — награда выдана и убирается из пула, чтобы
+            # её больше никому не выдало повторно. Админам оставляем её в
+            # списке — их выигрыш не тратит призовой фонд.
+            remove_reward_by_url(reward_url)
     else:
         text = (
             f"{custom_emoji(EMOJI_PARTY_CLAIM, '🎉')} Поздравляем, "
             f"{mention(user.id, user.full_name)}! Вы забрали {prize['value']}"
-            f"{custom_emoji(EMOJI_STAR_CLAIM, '⭐️')}!"
+            f"{custom_emoji(EMOJI_STAR_CLAIM, '⭐️')}!\n\n"
+            f"Дешёвые звёзды тут: @{CHEAP_STARS_BOT_USERNAME}"
         )
 
     del active_games[game_id]
